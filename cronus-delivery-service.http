@@ -1,0 +1,25 @@
+@host = http://localhost:5082
+
+### Liveness (process only, no dependency checks)
+GET {{host}}/health/live
+Accept: application/json
+
+### Readiness (includes PostgreSQL reachability)
+GET {{host}}/health/ready
+Accept: application/json
+
+### Create a delivery
+POST {{host}}/deliveries
+Content-Type: application/json
+
+{
+  "orderId": "11111111-1111-1111-1111-111111111111",
+  "customerName": "Ada Lovelace",
+  "addressLine": "1 Analytical Way",
+  "city": "London",
+  "postalCode": "E1 6AN"
+}
+
+### Get a delivery
+GET {{host}}/deliveries/00000000-0000-0000-0000-000000000000
+Accept: application/json

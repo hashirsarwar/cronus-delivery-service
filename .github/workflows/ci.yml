@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
+# A newer commit supersedes an in-flight run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    services:
+      # The suite runs against a real PostgreSQL server: the idempotency this service guarantees rests
+      # on a unique index and the error it raises, which an in-memory provider would not model.
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # The suite creates and migrates this database itself, and never touches a development one.
+      CRONUS_TEST_CONNECTION_STRING: "Host=localhost;Port=5432;Database=cronus_delivery_tests;Username=postgres;Password=postgres"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          # Latest 10.0 patch, so SDK security fixes are picked up without editing the workflow.
+          dotnet-version: 10.0.x
+          # The committed lock files are both the cache key and the source of a reproducible restore.
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+
+      # Locked mode restores exactly the committed dependency graph, and fails with NU1004 if a
+      # package reference changed without the lock file being regenerated and committed.
+      # Restoring the test project also restores the application it references.
+      - name: Restore
+        run: dotnet restore tests/Cronus.DeliveryService.Tests --locked-mode
+
+      - name: Build
+        run: dotnet build tests/Cronus.DeliveryService.Tests --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test tests/Cronus.DeliveryService.Tests --configuration Release --no-build
+
+  docker-image:
+    name: Docker image
+
+    # Gate publishing on the whole test job so a pushed tag cannot precede or bypass its tests.
+    needs: build-and-test
+
+    runs-on: ubuntu-latest
+
+    # Limit OIDC permission to this job; only a push to main reaches sign-in and requests a token.
+    permissions:
+      contents: read
+      id-token: write
+
+    # The image this application publishes, and the registry it publishes to. The registry
+    # repository is the image name, which is what the identity's registry permission is
+    # narrowed to.
+    env:
+      REGISTRY_NAME: acrcronusnonprod
+      REGISTRY_SERVER: acrcronusnonprod.azurecr.io
+      IMAGE: cronus-delivery-service
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build --tag cronus-delivery-service:ci .
+
+      - name: Smoke test the image
+        # A Production host does not apply migrations, and liveness must answer without a database, so
+        # this verifies that the image starts and that the two probes are genuinely separate, without
+        # needing PostgreSQL at all.
+        #
+        # Entra authentication is deliberately left at its Production default of on, so the connection
+        # string has to name a role: start-up rejects one that does not, and that rejection is the
+        # production configuration doing its job. The role never has to exist. Port 1 refuses the
+        # connection before any token is requested, which is why the readiness assertion below fails in
+        # well under a second rather than waiting on a credential this machine does not have.
+        run: |
+          docker run --detach --name smoke --publish 5092:8080 \
+            --env ASPNETCORE_ENVIRONMENT=Production \
+            --env 'ConnectionStrings__CronusDelivery=Host=127.0.0.1;Port=1;Database=none;Timeout=1;Username=smoke-test' \
+            cronus-delivery-service:ci
+
+          for _ in {1..30}; do
+            if curl --fail --silent http://localhost:5092/health/live >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          http_status() { curl --silent --output /dev/null --write-out '%{http_code}' "$1"; }
+
+          test "$(http_status http://localhost:5092/health/live)" = 200   # the process is up
+          test "$(http_status http://localhost:5092/health/ready)" = 503  # the database is not
+
+      - name: Container logs
+        if: failure()
+        run: docker logs smoke || true
+
+      - name: Remove the container
+        if: always()
+        run: docker rm --force smoke || true
+
+      # Nothing above this point reaches Azure, and nothing below it runs for a pull
+      # request. The identity is assumed through GitHub's OIDC provider, so this repository
+      # holds no client secret and there is nothing to rotate.
+      - name: Sign in to Azure
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: azure/login@v3
+        with:
+          # Repository variables, not secrets: a client id identifies an identity, it does
+          # not authenticate as one. Set them from `terraform output` in the infrastructure
+          # repository, along with the tenant and subscription.
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push the tested image
+        # Addressed by its output below, so the digest the summary reports is the one this step resolved
+        # rather than one read again later.
+        id: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Docker is authenticated with a token derived from the OIDC session above, so no
+          # registry password is used and none is stored.
+          az acr login --name "$REGISTRY_NAME"
+
+          # The image built and smoke tested above, tagged with the commit it came from. The
+          # tag is the full SHA so an image can be traced back to a commit without depending
+          # on a moving tag.
+          docker tag "$IMAGE:ci" "$REGISTRY_SERVER/$IMAGE:${{ github.sha }}"
+          docker push "$REGISTRY_SERVER/$IMAGE:${{ github.sha }}"
+
+          # Read back from the registry rather than taken from the push. The digest is the registry's
+          # answer about the bytes it now holds, and it is what a promotion resolves and copies.
+          digest="$(az acr manifest show-metadata \
+            --registry "$REGISTRY_NAME" \
+            --name "$IMAGE:${{ github.sha }}" \
+            --query digest --output tsv)"
+
+          if [ -z "$digest" ]; then
+            echo "::error::$REGISTRY_SERVER/$IMAGE:${{ github.sha }} has no digest in the registry, so the push did not store it."
+            exit 1
+          fi
+
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $REGISTRY_SERVER/$IMAGE:${{ github.sha }} ($digest)."
+
+      - name: Record the published image digest
+        # What an operator reads before promoting. The digest is printed rather than left to be discovered
+        # with the CLI, because the promotion workflow checks it without ever being told what to expect.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          {
+            echo "### Image published to nonprod"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| registry | \`$REGISTRY_SERVER\` |"
+            echo "| repository | \`$IMAGE\` |"
+            echo "| tag | \`${{ github.sha }}\` |"
+            echo "| digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo
+            echo "Promoting this is a separate, manual step. It checks that this commit is in main's"
+            echo "history and that a successful build run of it exists, then copies the digest rather than"
+            echo "rebuilding. Cryptographic build provenance is not currently enforced; see cronus-gitops."
+            echo
+            echo "To promote it, run the **Promote to production** workflow with"
+            echo "\`commit_sha=${{ github.sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

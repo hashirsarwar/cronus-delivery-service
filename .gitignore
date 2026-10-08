@@ -1,0 +1,20 @@
+## .NET build output
+bin/
+obj/
+
+## Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+
+## Local secrets and machine-specific configuration.
+## Keep connection strings and credentials out of the repository; see appsettings.Development.json
+## for the credential-free local defaults, or use environment variables.
+appsettings.Local.json
+*.Local.json
+.env
+.env.*
+
+## OS
+.DS_Store

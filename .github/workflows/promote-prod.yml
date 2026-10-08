@@ -1,0 +1,347 @@
+name: Promote to production
+
+# Manual dispatch authorizes copying a source-registry digest; this workflow never rebuilds it.
+# No signed build provenance is verified; see cronus-gitops README.md, production release runbook.
+# Do not add environment: it rewrites the OIDC subject and breaks ref-based federation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full 40-character SHA of the main commit whose image is being promoted
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  # Read, and only read, and only so the check that a successful build run exists for the commit can look
+  # at this repository's own workflow runs.
+  actions: read
+
+# Serialize promotions without cancellation so retries do not race registry imports.
+concurrency:
+  group: promote-prod-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REGISTRY_NAME: acrcronusnonprod
+  REGISTRY_NAME: acrcronusprod
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.commit_sha }}
+    runs-on: ubuntu-latest
+
+    # A promotion publishes what production runs, so it only ever starts from main. The commit
+    # being promoted is an input, and is checked below to be an ancestor of main rather than
+    # merely to exist.
+    if: github.ref == 'refs/heads/main'
+
+    env:
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      IMAGE: cronus-delivery-service
+      SOURCE_REGISTRY_ID: ${{ vars.PROMOTION_SOURCE_REGISTRY_ID }}
+      REGISTRY_RESOURCE_GROUP: ${{ vars.PROMOTION_DESTINATION_RESOURCE_GROUP }}
+
+    steps:
+      - name: Validate the inputs
+        # The SHA comes from a person, so it is treated as untrusted input: nothing below
+        # interpolates it into a script, and this is what rejects anything that is not exactly a
+        # full commit SHA.
+        run: |
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::commit_sha must be a full 40-character lowercase commit SHA; received '$COMMIT_SHA'."
+            exit 1
+          fi
+
+          # Require explicit registry coordinates: this identity cannot perform subscription-wide lookups.
+          if [ -z "$SOURCE_REGISTRY_ID" ]; then
+            echo "::error::PROMOTION_SOURCE_REGISTRY_ID is not set for this repository. See the production release runbook in cronus-gitops."
+            exit 1
+          fi
+
+          if [ -z "$REGISTRY_RESOURCE_GROUP" ]; then
+            echo "::error::PROMOTION_DESTINATION_RESOURCE_GROUP is not set for this repository. See the production release runbook in cronus-gitops."
+            exit 1
+          fi
+
+      - name: Check out main with full history
+        # Full history rather than the default shallow clone: whether the commit is in main's
+        # history is decided below with git, and that question cannot be answered from one commit.
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check the commit is on main
+        run: |
+          # Require a commit in main's history before resolving its image tag.
+          if ! git cat-file -e "${COMMIT_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::$COMMIT_SHA is not a commit in this repository."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" origin/main; then
+            echo "::error::$COMMIT_SHA is not in the history of main; refusing to promote it."
+            exit 1
+          fi
+
+      - name: Check CI passed for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Require successful push CI on main; PR runs do not publish images.
+          # This proves CI ran for the commit, not that the current tag still names its build.
+          # Expired workflow-run history prevents promotion; roll back by promoting a revert on main.
+          runs="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$COMMIT_SHA" \
+            --jq '.workflow_runs[]
+                  | select(.event == "push" and .head_branch == "main" and .conclusion == "success")
+                  | .html_url')"
+
+          if [ -z "$runs" ]; then
+            echo "::error::No successful push build of ci.yml was found for $COMMIT_SHA on main. Only an image built and tested by continuous integration can be promoted."
+            exit 1
+          fi
+
+          echo "Continuous integration succeeded for $COMMIT_SHA:"
+          echo "$runs"
+
+      - name: Verify the workload identity subject
+        env:
+          EXPECTED_SUBJECT: ${{ vars.AZURE_FEDERATED_SUBJECT_PROD }}
+        run: |
+          # Check the actual OIDC subject before Azure login; environment: would rewrite it and cause AADSTS70021.
+          token="$(curl --silent --show-error --fail \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" \
+            | jq --raw-output '.value')"
+
+          # The payload is base64url with the padding removed, which base64 needs put back.
+          payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          case $(( ${#payload} % 4 )) in
+            2) payload="${payload}==" ;;
+            3) payload="${payload}=" ;;
+          esac
+          claims="$(printf '%s' "$payload" | base64 --decode)"
+
+          subject="$(jq --raw-output '.sub' <<<"$claims")"
+          audience="$(jq --raw-output '.aud' <<<"$claims")"
+
+          {
+            echo "### Workload identity"
+            echo
+            echo "Subject: \`$subject\`"
+            echo
+            echo "<details><summary>Token claims</summary>"
+            echo
+            echo '```json'
+            jq . <<<"$claims"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$audience" != "api://AzureADTokenExchange" ]; then
+            echo "::error::The token is for audience '$audience', not api://AzureADTokenExchange."
+            exit 1
+          fi
+
+          case "$subject" in
+            *':environment:'*)
+              echo "::error::The OIDC subject is '$subject'. An environment on this job rewrites the subject, and no federated credential matches it."
+              exit 1
+              ;;
+            *':ref:refs/heads/main') ;;
+            *)
+              echo "::error::The OIDC subject is '$subject', which is not a ref-based subject for main."
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$EXPECTED_SUBJECT" ]; then
+            echo "::warning::AZURE_FEDERATED_SUBJECT_PROD is not set, so the subject was checked for shape only. Set it to the production federated credential's subject for an exact comparison."
+          elif [ "$subject" != "$EXPECTED_SUBJECT" ]; then
+            echo "::error::The OIDC subject is '$subject' but AZURE_FEDERATED_SUBJECT_PROD is '$EXPECTED_SUBJECT'. One of the two is wrong."
+            exit 1
+          fi
+
+          echo "Subject '$subject' matches the production federated credential."
+
+      - name: Sign in to Azure
+        # Use the separate production identity with repository grants for this application.
+        # Set AZURE_CLIENT_ID_PROD from production Terraform outputs; client IDs are identifiers, not secrets.
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify the Azure context
+        # Compare token claims with independently supplied expected IDs, not login inputs read back as themselves.
+        env:
+          EXPECTED_APPLICATION_ID: ${{ vars.AZURE_CLIENT_ID_PROD }}
+          EXPECTED_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+        run: |
+          # Check the issued token's identity rather than assuming Azure login used the intended principal.
+          token="$(az account get-access-token --query accessToken --output tsv)"
+
+          # The payload is base64url with the padding removed, which base64 needs put back.
+          payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          case $(( ${#payload} % 4 )) in
+            2) payload="${payload}==" ;;
+            3) payload="${payload}=" ;;
+          esac
+          claims="$(printf '%s' "$payload" | base64 --decode)"
+
+          # `appid` is the claim a service principal's token carries; `azp` is what some token shapes use
+          # for the same thing. Either is the client id, and neither being present is a failure rather
+          # than something to carry on from.
+          app_id="$(jq --raw-output '.appid // .azp // empty' <<<"$claims")"
+          tenant="$(jq --raw-output '.tid' <<<"$claims")"
+          object_id="$(jq --raw-output '.oid' <<<"$claims")"
+          subscription="$(az account show --query id --output tsv)"
+
+          if [ -z "$app_id" ]; then
+            echo "::error::The access token carries no appid or azp claim, so the identity it belongs to cannot be established."
+            exit 1
+          fi
+
+          if [ "$app_id" != "$EXPECTED_APPLICATION_ID" ]; then
+            echo "::error::The token belongs to application '$app_id', not AZURE_CLIENT_ID_PROD ('$EXPECTED_APPLICATION_ID'). Only this application's identity has registry grants narrowed to its own repositories."
+            exit 1
+          fi
+
+          if [ "$tenant" != "$EXPECTED_TENANT_ID" ]; then
+            echo "::error::The token is from tenant '$tenant', not AZURE_TENANT_ID ('$EXPECTED_TENANT_ID')."
+            exit 1
+          fi
+
+          # Read destination coordinates from Azure to verify the signed-in subscription.
+          # Name its resource group explicitly to avoid an unauthorized subscription-wide lookup.
+          destination_id="$(az acr show \
+            --name "$REGISTRY_NAME" \
+            --resource-group "$REGISTRY_RESOURCE_GROUP" \
+            --query id --output tsv)"
+
+          destination_subscription="${destination_id#/subscriptions/}"
+          destination_subscription="${destination_subscription%%/*}"
+          source_subscription="${SOURCE_REGISTRY_ID#/subscriptions/}"
+          source_subscription="${source_subscription%%/*}"
+
+          if [ "$destination_subscription" != "$subscription" ]; then
+            echo "::error::$REGISTRY_NAME is in subscription $destination_subscription, but this workflow is signed in to $subscription. Check AZURE_SUBSCRIPTION_ID and PROMOTION_DESTINATION_RESOURCE_GROUP."
+            exit 1
+          fi
+
+          if [ "$source_subscription" != "$subscription" ]; then
+            echo "::error::PROMOTION_SOURCE_REGISTRY_ID names a registry in subscription $source_subscription, but this workflow is signed in to $subscription."
+            exit 1
+          fi
+
+          {
+            echo "### Azure context"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| application id | \`$app_id\` |"
+            echo "| object id | \`$object_id\` |"
+            echo "| tenant | \`$tenant\` |"
+            echo "| subscription | \`$subscription\` |"
+            echo "| destination registry | \`$destination_id\` |"
+            echo "| source registry | \`$SOURCE_REGISTRY_ID\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Signed in as $app_id in tenant $tenant, subscription $subscription."
+
+      - name: Resolve the source digest
+        run: |
+          # The image as the source registry holds it. The tag is what the commit is called; the
+          # digest is what identifies the bytes, and it is resolved once and then used for
+          # everything, so a tag that moved between two steps could not change what is copied.
+          digest="$(az acr manifest show-metadata \
+            --registry "$SOURCE_REGISTRY_NAME" \
+            --name "$IMAGE:$COMMIT_SHA" \
+            --query digest --output tsv)"
+
+          if [ -z "$digest" ]; then
+            echo "::error::$SOURCE_REGISTRY_NAME/$IMAGE:$COMMIT_SHA has no digest, so there is nothing to promote."
+            exit 1
+          fi
+
+          echo "SOURCE_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "Source: $SOURCE_REGISTRY_NAME/$IMAGE@$digest"
+
+      - name: Check the destination tag
+        run: |
+          # Whether the tag is already in production decides whether there is anything to do. The
+          # command fails when the manifest is not there, and which way it failed does not matter
+          # here: the import below refuses to overwrite an existing tag, so a check that wrongly
+          # concluded "absent" leads to an import that fails loudly rather than to an overwrite.
+          existing="$(az acr manifest show-metadata \
+            --registry "$REGISTRY_NAME" \
+            --name "$IMAGE:$COMMIT_SHA" \
+            --query digest --output tsv 2>/dev/null || true)"
+
+          if [ -z "$existing" ]; then
+            echo "IMPORT_RESULT=performed" >> "$GITHUB_ENV"
+            echo "$REGISTRY_NAME/$IMAGE:$COMMIT_SHA is not in production yet."
+          elif [ "$existing" = "$SOURCE_DIGEST" ]; then
+            # Re-running a promotion is then a no-op, which is what makes a retry after a failure
+            # later in the workflow safe to do.
+            echo "ALREADY_PROMOTED=true" >> "$GITHUB_ENV"
+            echo "IMPORT_RESULT=skipped, the tag already pointed at this digest" >> "$GITHUB_ENV"
+            echo "$REGISTRY_NAME/$IMAGE:$COMMIT_SHA is already $existing."
+          else
+            echo "::error::$REGISTRY_NAME/$IMAGE:$COMMIT_SHA exists with digest $existing, which differs from the source digest $SOURCE_DIGEST. The tag means two different things and a person has to decide which."
+            exit 1
+          fi
+
+      - name: Import into the production registry
+        if: env.ALREADY_PROMOTED != 'true'
+        run: |
+          # Copy the resolved source digest inside ACR; nothing is rebuilt or downloaded by the runner.
+          # Explicit registry coordinates avoid subscription-wide lookups this identity cannot perform.
+          az acr import \
+            --name "$REGISTRY_NAME" \
+            --resource-group "$REGISTRY_RESOURCE_GROUP" \
+            --registry "$SOURCE_REGISTRY_ID" \
+            --source "$IMAGE@$SOURCE_DIGEST" \
+            --image "$IMAGE:$COMMIT_SHA"
+
+      - name: Verify the imported digest
+        run: |
+          # Require the destination digest to match the resolved source digest after import.
+          destination="$(az acr manifest show-metadata \
+            --registry "$REGISTRY_NAME" \
+            --name "$IMAGE:$COMMIT_SHA" \
+            --query digest --output tsv)"
+
+          if [ "$destination" != "$SOURCE_DIGEST" ]; then
+            echo "::error::$REGISTRY_NAME/$IMAGE:$COMMIT_SHA is $destination, but the source digest was $SOURCE_DIGEST."
+            exit 1
+          fi
+
+          echo "DESTINATION_DIGEST=$destination" >> "$GITHUB_ENV"
+          echo "Production: $REGISTRY_NAME/$IMAGE@$destination"
+
+      - name: Summarise the promotion
+        # Runs whether the steps above succeeded or not, so an attempt is recorded either way.
+        if: always()
+        run: |
+          {
+            echo "### Production promotion"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| commit | \`$COMMIT_SHA\` |"
+            echo "| source | \`$SOURCE_REGISTRY_NAME/$IMAGE\` |"
+            echo "| source digest | \`${SOURCE_DIGEST:-unknown}\` |"
+            echo "| production registry | \`$REGISTRY_NAME\` |"
+            echo "| production digest | \`${DESTINATION_DIGEST:-unknown}\` |"
+            echo "| import | \`${IMPORT_RESULT:-not reached}\` |"
+            echo
+            echo "Deploying it is a separate, reviewed change: set \`image.tag\` for this application in"
+            echo "\`cronus-gitops\` to \`$COMMIT_SHA\` and open a pull request."
+          } >> "$GITHUB_STEP_SUMMARY"

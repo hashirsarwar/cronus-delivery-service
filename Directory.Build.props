@@ -1,0 +1,9 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- Commit the dependency graph so CI and image builds use reviewed packages.
+         Locked restores fail when project files disagree with packages.lock.json. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+</Project>

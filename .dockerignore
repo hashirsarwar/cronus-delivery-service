@@ -1,0 +1,34 @@
+# Host build output. Copying it in would shadow the build performed inside the image.
+bin/
+obj/
+
+# The test project is not part of the image, and its sources would otherwise be pulled into the
+# compilation by the SDK's recursive globs.
+tests/
+
+# Version control, editor state, and continuous integration configuration. The build reads none of
+# these; excluding the workflows also stops a CI edit from invalidating the cached COPY layer.
+.git/
+.gitignore
+.github/
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Local secrets and machine-specific configuration, so they can never be baked into an image.
+appsettings.Local.json
+*.Local.json
+.env
+.env.*
+
+# Documentation and OS noise, not needed at run time.
+README.md
+*.md
+.DS_Store
+
+# Not needed by any COPY instruction, so they stay out of the image. The daemon still receives them,
+# because it needs the Dockerfile to build at all.
+Dockerfile
+.dockerignore

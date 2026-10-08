@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Cronus.DeliveryService</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <!-- Pinned explicitly: the application must declare the EF Core version it is compiled against.
+         Relying on the transitive graph leaves this at 10.0.0 (what the Npgsql provider requests),
+         which the test project then resolves differently from this assembly. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.8" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.8" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.8">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.0" />
+    <!-- Passwordless authentication to Azure Database for PostgreSQL. Npgsql has no dependency on
+         this and no built-in Entra support of its own, so the token is obtained here and handed to
+         the connection pool: see Data/PostgresDataSourceFactory.cs. -->
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
+    <!-- Application telemetry. The distro brings the OpenTelemetry SDK together with the Azure
+         Monitor exporter for traces, metrics and logs, and registers the ASP.NET Core and
+         HttpClient instrumentation that produces and propagates spans. See
+         Telemetry/ApplicationTelemetry.cs. -->
+    <PackageReference Include="Azure.Monitor.OpenTelemetry.AspNetCore" Version="1.6.0" />
+    <!-- Client spans for the database. EF Core reaches PostgreSQL through Npgsql, so subscribing to
+         its activity source is what puts query time inside the request trace rather than beside it.
+         AddNpgsql only subscribes; the statement text Npgsql writes to those spans is removed before
+         export by Telemetry/DatabaseStatementRedactingProcessor.cs. -->
+    <PackageReference Include="Npgsql.OpenTelemetry" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The test project lives under tests/. Keep it out of this project's default source globs,
+         otherwise its files are compiled into the application assembly as well. -->
+    <Compile Remove="tests/**" />
+    <Content Remove="tests/**" />
+    <None Remove="tests/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets the test project drive the real application host via WebApplicationFactory without
+         widening the application's public surface. -->
+    <InternalsVisibleTo Include="Cronus.DeliveryService.Tests" />
+  </ItemGroup>
+
+</Project>
